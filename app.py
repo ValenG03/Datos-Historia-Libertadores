@@ -298,6 +298,14 @@ CHAMPION_CLUBS = [
     ("Botafogo", "Brasil", "botafogo", "Botafogo de Futebol e Regatas"),
 ]
 WIKI_UA = {"User-Agent": "LibertadoresDataApp/1.0 (Streamlit educational dashboard)"}
+# Títulos alternativos por club (se prueban en es / pt / en Wikipedia)
+EXTRA_TITLES = {
+    "colocolo": ["Colo-Colo", "Club Social y Deportivo Colo-Colo", "Colo Colo"],
+}
+# Búsqueda directa del archivo del escudo en Wikimedia Commons (último recurso)
+COMMONS_QUERY = {
+    "colocolo": "Colo-Colo escudo",
+}
 
 
 def _normalize_png(raw: bytes, size: int = 256) -> str:
@@ -357,23 +365,51 @@ def load_crests():
                 pass
         pending.append((slug, title))
 
-    for lang in ("es", "pt"):
+    for lang in ("es", "pt", "en"):
         if not pending:
             break
-        thumbs = _wiki_thumbs(lang, [t for _, t in pending])
+        titles = []
+        for slug, title in pending:
+            titles += [title] + EXTRA_TITLES.get(slug, [])
+        thumbs = _wiki_thumbs(lang, list(dict.fromkeys(titles)))
         still = []
         for slug, title in pending:
-            url = thumbs.get(title)
-            if url:
+            got = False
+            for t in [title] + EXTRA_TITLES.get(slug, []):
+                url = thumbs.get(t)
+                if not url:
+                    continue
                 try:
                     img = requests.get(url, headers=WIKI_UA, timeout=8)
                     if img.status_code == 200 and img.headers.get("Content-Type", "").startswith("image/"):
                         crests[slug] = _normalize_png(img.content)
-                        continue
+                        got = True
+                        break
                 except Exception:
                     pass
-            still.append((slug, title))
+            if not got:
+                still.append((slug, title))
         pending = still
+
+    # último recurso: buscar el archivo del escudo directamente en Commons (SVG/PNG)
+    names = {slug: name for name, _, slug, _ in CHAMPION_CLUBS}
+    for slug, _ in pending:
+        try:
+            r = requests.get("https://commons.wikimedia.org/w/api.php", headers=WIKI_UA, timeout=8, params={
+                "action": "query", "generator": "search",
+                "gsrsearch": COMMONS_QUERY.get(slug, f"{names[slug]} escudo"),
+                "gsrnamespace": 6, "gsrlimit": 8, "prop": "imageinfo", "iiprop": "url|mime",
+                "iiurlwidth": 400, "format": "json", "formatversion": 2})
+            pages = sorted(r.json().get("query", {}).get("pages", []), key=lambda p: p.get("index", 99))
+            for p in pages:
+                info = (p.get("imageinfo") or [{}])[0]
+                if info.get("mime") in ("image/svg+xml", "image/png") and info.get("thumburl"):
+                    img = requests.get(info["thumburl"], headers=WIKI_UA, timeout=8)
+                    if img.status_code == 200 and img.headers.get("Content-Type", "").startswith("image/"):
+                        crests[slug] = _normalize_png(img.content)
+                        break
+        except Exception:
+            pass
     return crests
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -730,7 +766,6 @@ h1 .outline{color:transparent;-webkit-text-stroke:1.4px rgba(246,222,151,.75)}
     <div class="cupzone" id="cupzone">
       <div class="halo"></div><div class="ring"></div><div class="ring r2"></div><div class="floor"></div>
       __CUP__
-      <div class="tag"><b>LA COPA</b>Plata 925 · Orfebre Alberto de Gasperi<br>Joyería Camusso · Lima</div>
     </div>
   </div>
   <div class="kpis">
@@ -805,7 +840,10 @@ ticker_items = "".join(f'<span><b>{y}</b>{c} {FLAGS.get(p, "")}</span>' for y, c
 hero_doc = (HERO_HTML.replace("__H__", str(HERO_HEIGHT))
             .replace("__CUP__", cup_html)
             .replace("__TICKER__", ticker_items * 2))
-components.html(hero_doc, height=HERO_HEIGHT + 8, scrolling=False)
+if hasattr(st, "iframe"):
+    st.iframe(hero_doc, height=HERO_HEIGHT + 8)
+else:
+    components.html(hero_doc, height=HERO_HEIGHT + 8, scrolling=False)
 st.markdown('<div class="rule"></div>', unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
