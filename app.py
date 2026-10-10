@@ -18,6 +18,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -543,30 +544,269 @@ def card(tag, big, who, meta, ember=False):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HERO
+# HERO · primer pantallazo interactivo (iframe propio para poder usar JS)
+# Foto del trofeo: assets/trofeo.png (si existe, idealmente con fondo transparente)
+#                  → si no, foto libre de Wikimedia Commons del artículo "Copa Libertadores (trophy)"
 # ──────────────────────────────────────────────────────────────────────────────
-st.markdown(f"""
-<div class="hero">
-  <div class="hero-txt">
-    <div class="eyebrow">Análisis cuantitativo · 1960 — 2026</div>
-    <h1>La Gloria Eterna<br><span>en números</span></h1>
-    <p class="lead">Sesenta y seis ediciones terminadas y una en juego. Goleadores, asistidores, arqueros,
-    clubes y finales de la copa más importante de Sudamérica, contados con datos.</p>
-  </div>
-  <div class="hero-cup">{trophy_svg(210, "hero")}<div class="hero-cup-cap">66 copas levantadas</div></div>
-</div>
-""", unsafe_allow_html=True)
+def _feather(im: Image.Image) -> Image.Image:
+    """Funde los bordes de una foto con fondo en un halo elíptico (sin deformar la imagen)."""
+    from PIL import ImageDraw, ImageFilter
+    w, h = im.size
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).ellipse((int(w * .10), int(h * .04), int(w * .90), int(h * .98)), fill=255)
+    mask = mask.filter(ImageFilter.GaussianBlur(min(w, h) * .07))
+    base_alpha = im.getchannel("A")
+    from PIL import ImageChops
+    im.putalpha(ImageChops.multiply(base_alpha, mask))
+    return im
 
-st.markdown(f"""
-<div class="kpis">
-  <div class="kpi"><div class="v">66</div><div class="l"><b>Ediciones completas</b><br>1960 → 2025 · la 2026 está en semifinales</div></div>
-  <div class="kpi"><div class="v">54</div><div class="l"><b>Goles de Alberto Spencer</b><br>Máximo goleador histórico {FLAGS['Ecuador']}</div></div>
-  <div class="kpi"><div class="v">7/7</div><div class="l"><b>Independiente</b><br>Finales jugadas, finales ganadas {FLAGS['Argentina']}</div></div>
-  <div class="kpi"><div class="v">681</div><div class="l"><b>Goles de River Plate</b><br>El club más goleador {FLAGS['Argentina']}</div></div>
-  <div class="kpi"><div class="v">25·25</div><div class="l"><b>Argentina · Brasil</b><br>Títulos por país, empatados</div></div>
+
+def _trophy_from_bytes(raw: bytes, transparent_hint: bool) -> str:
+    from PIL import ImageEnhance
+    im = Image.open(io.BytesIO(raw)).convert("RGBA")
+    has_alpha = im.getchannel("A").getextrema()[0] < 250
+    if has_alpha:
+        bbox = im.getchannel("A").getbbox()
+        if bbox:
+            im = im.crop(bbox)
+    else:
+        im = ImageEnhance.Contrast(im).enhance(1.08)
+        im = _feather(im)
+    im.thumbnail((900, 900), Image.LANCZOS)          # mantiene proporción
+    buf = io.BytesIO()
+    im.save(buf, format="PNG", optimize=True)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24 * 7)
+def load_trophy():
+    local = Path(__file__).parent / "assets" / "trofeo.png"
+    if local.exists():
+        try:
+            return _trophy_from_bytes(local.read_bytes(), True)
+        except Exception:
+            pass
+    sources = []
+    try:
+        if "TROPHY_URL" in st.secrets:
+            sources.append(st.secrets["TROPHY_URL"])
+    except Exception:
+        pass
+    try:  # imagen principal del artículo del trofeo
+        r = requests.get("https://en.wikipedia.org/w/api.php", headers=WIKI_UA, timeout=8, params={
+            "action": "query", "titles": "Copa Libertadores (trophy)", "prop": "pageimages",
+            "piprop": "thumbnail", "pithumbsize": 900, "format": "json", "formatversion": 2})
+        for p in r.json().get("query", {}).get("pages", []):
+            if p.get("thumbnail"):
+                sources.append(p["thumbnail"]["source"])
+    except Exception:
+        pass
+    try:  # respaldo: búsqueda de archivos en Commons
+        r = requests.get("https://commons.wikimedia.org/w/api.php", headers=WIKI_UA, timeout=8, params={
+            "action": "query", "generator": "search", "gsrsearch": "Copa Libertadores trophy",
+            "gsrnamespace": 6, "gsrlimit": 6, "prop": "imageinfo", "iiprop": "url|mime",
+            "iiurlwidth": 900, "format": "json", "formatversion": 2})
+        pages = sorted(r.json().get("query", {}).get("pages", []), key=lambda p: p.get("index", 99))
+        for p in pages:
+            info = (p.get("imageinfo") or [{}])[0]
+            if info.get("mime", "").startswith("image/") and "svg" not in info.get("mime", ""):
+                sources.append(info.get("thumburl") or info.get("url"))
+    except Exception:
+        pass
+    for url in sources:
+        try:
+            img = requests.get(url, headers=WIKI_UA, timeout=10)
+            if img.status_code == 200 and img.headers.get("Content-Type", "").startswith("image/"):
+                return _trophy_from_bytes(img.content, False)
+        except Exception:
+            continue
+    return None
+
+
+HERO_HTML = r"""
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;700;800;900&family=Manrope:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--gold:#E8C15A;--soft:#F6DE97;--deep:#A67C1F;--ember:#E2553F;--ink:#0A0C12;--panel:#11141D;--line:#232838;--text:#ECE7DA;--muted:#8E8A80}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:transparent;color:var(--text);font-family:'Manrope',system-ui,sans-serif;overflow:hidden}
+.stage{position:relative;height:__H__px;display:flex;flex-direction:column;border-radius:28px;overflow:hidden;isolation:isolate;
+  background:radial-gradient(900px 520px at 78% 38%,rgba(232,193,90,.13),transparent 62%),
+             radial-gradient(700px 420px at 8% 110%,rgba(226,85,63,.08),transparent 60%),
+             linear-gradient(180deg,#0D1018,#090B11);border:1px solid rgba(232,193,90,.14)}
+.stage:after{content:"";position:absolute;inset:0;pointer-events:none;border-radius:28px;
+  background:radial-gradient(420px 420px at var(--mx,70%) var(--my,40%),rgba(246,222,151,.08),transparent 60%);transition:background .08s}
+canvas#dust{position:absolute;inset:0;z-index:0;pointer-events:none}
+.grid{position:absolute;inset:0;z-index:0;opacity:.35;pointer-events:none;
+  background-image:linear-gradient(rgba(232,193,90,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(232,193,90,.05) 1px,transparent 1px);
+  background-size:56px 56px;mask-image:radial-gradient(ellipse at 70% 40%,#000 10%,transparent 70%)}
+.wrap{position:relative;z-index:2;display:grid;grid-template-columns:1.25fr .9fr;gap:12px;flex:1;min-height:0;padding:40px 48px 18px}
+.live{display:inline-flex;align-items:center;gap:10px;font:500 11.5px 'IBM Plex Mono';letter-spacing:.26em;text-transform:uppercase;color:var(--gold);
+  padding:7px 14px;border:1px solid rgba(232,193,90,.28);border-radius:999px;background:rgba(232,193,90,.05)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ember);box-shadow:0 0 0 0 rgba(226,85,63,.7);animation:ping 1.8s infinite}
+@keyframes ping{70%{box-shadow:0 0 0 9px rgba(226,85,63,0)}100%{box-shadow:0 0 0 0 rgba(226,85,63,0)}}
+h1{font-family:'Barlow Condensed','Oswald','Arial Narrow',sans-serif;font-stretch:condensed;font-weight:900;text-transform:uppercase;line-height:.86;letter-spacing:.005em;
+  font-size:clamp(50px,6.6vw,100px);margin:20px 0 16px}
+h1 .line{display:block;overflow:hidden;padding-bottom:.04em}
+h1 .w{display:inline-block;transform:translateY(105%);opacity:0;animation:rise .9s cubic-bezier(.2,.8,.2,1) forwards}
+h1 .gold{background:linear-gradient(100deg,var(--deep) 0%,var(--gold) 22%,#FFF3C4 34%,var(--gold) 46%,var(--soft) 70%,var(--deep) 100%);
+  background-size:250% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;animation:rise .9s cubic-bezier(.2,.8,.2,1) forwards,sheen 6s 1.4s linear infinite}
+h1 .outline{color:transparent;-webkit-text-stroke:1.4px rgba(246,222,151,.75)}
+@keyframes rise{to{transform:none;opacity:1}}
+@keyframes sheen{from{background-position:120% 0}to{background-position:-130% 0}}
+.lead{max-width:560px;color:#C9C2B2;font-size:16.5px;line-height:1.65;opacity:0;animation:fade 1s .9s forwards}
+.lead b{color:var(--soft);font-weight:600}
+@keyframes fade{to{opacity:1}}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px;opacity:0;animation:fade 1s 1.15s forwards}
+.chip{font:500 11.5px 'IBM Plex Mono';letter-spacing:.06em;color:var(--text);padding:9px 14px;border-radius:12px;cursor:pointer;
+  background:linear-gradient(180deg,#151926,#10131C);border:1px solid var(--line);transition:all .25s;display:inline-flex;gap:8px;align-items:center}
+.chip:hover{border-color:var(--gold);color:var(--soft);transform:translateY(-2px);box-shadow:0 8px 24px -10px rgba(232,193,90,.45)}
+.chip .n{color:var(--gold)}
+/* trofeo */
+.cupzone{position:relative;display:flex;align-items:center;justify-content:center;perspective:1100px;min-height:0}
+.halo{position:absolute;width:78%;aspect-ratio:1;border-radius:50%;left:50%;top:50%;transform:translate(-50%,-52%);
+  background:conic-gradient(from 0deg,transparent 0 20%,rgba(246,222,151,.22) 30%,transparent 42% 70%,rgba(232,193,90,.16) 80%,transparent 90%);
+  filter:blur(18px);animation:spin 14s linear infinite}
+.ring{position:absolute;width:64%;aspect-ratio:1;border-radius:50%;left:50%;top:50%;transform:translate(-50%,-52%);
+  border:1px solid rgba(232,193,90,.22);box-shadow:inset 0 0 60px rgba(232,193,90,.08),0 0 40px rgba(232,193,90,.06)}
+.ring.r2{width:82%;border-style:dashed;border-color:rgba(232,193,90,.10);animation:spin 60s linear infinite reverse}
+@keyframes spin{to{transform:translate(-50%,-52%) rotate(360deg)}}
+.tilt{position:relative;height:100%;max-height:100%;display:flex;align-items:center;justify-content:center;
+  transform-style:preserve-3d;transition:transform .18s ease-out;will-change:transform;opacity:0;animation:cupin 1.4s .3s cubic-bezier(.2,.8,.2,1) forwards}
+@keyframes cupin{from{opacity:0;transform:translateY(30px) scale(.94)}to{opacity:1;transform:none}}
+.cup{height:100%;max-height:100%;width:auto;max-width:100%;object-fit:contain;display:block;
+  filter:drop-shadow(0 26px 40px rgba(0,0,0,.65)) drop-shadow(0 0 26px rgba(232,193,90,.22));animation:float 7s ease-in-out infinite}
+@keyframes float{0%,100%{translate:0 0}50%{translate:0 -8px}}
+.glint{position:absolute;inset:0;pointer-events:none;mix-blend-mode:screen;opacity:.0;
+  background:linear-gradient(115deg,transparent 35%,rgba(255,246,210,.55) 48%,transparent 60%);background-size:260% 100%;
+  -webkit-mask:var(--cupmask) center/contain no-repeat;mask:var(--cupmask) center/contain no-repeat;animation:glint 5.5s 2s ease-in-out infinite}
+@keyframes glint{0%{opacity:0;background-position:120% 0}12%{opacity:1}35%{opacity:0;background-position:-40% 0}100%{opacity:0}}
+.floor{position:absolute;bottom:2%;left:50%;width:62%;height:26px;transform:translateX(-50%);border-radius:50%;
+  background:radial-gradient(ellipse,rgba(232,193,90,.28),transparent 70%);filter:blur(6px)}
+.tag{position:absolute;right:0;top:2%;z-index:3;font:500 10.5px 'IBM Plex Mono';letter-spacing:.14em;color:var(--muted);
+  text-align:right;line-height:1.7;opacity:0;animation:fade 1s 1.6s forwards}
+.tag b{display:block;color:var(--gold);letter-spacing:.24em;font-weight:500}
+.nocup{display:flex;align-items:center;justify-content:center;height:100%;font:500 11px 'IBM Plex Mono';color:var(--muted);letter-spacing:.2em;text-align:center}
+/* KPIs */
+.kpis{position:relative;flex:0 0 auto;z-index:3;display:grid;grid-template-columns:repeat(5,1fr);margin:0 48px;
+  border-top:1px solid rgba(232,193,90,.16)}
+.k{padding:14px 14px 14px;border-right:1px solid rgba(232,193,90,.10);cursor:default;transition:background .3s}
+.k:last-child{border-right:0}
+.k:hover{background:linear-gradient(180deg,rgba(232,193,90,.07),transparent)}
+.k .v{font:800 40px/1 'Barlow Condensed';color:var(--soft);font-variant-numeric:tabular-nums}
+.k .v small{font-size:18px;color:var(--gold);margin-left:2px}
+.k .l{font-size:11.5px;color:var(--muted);margin-top:5px;line-height:1.35}
+.k .l b{color:var(--text);font-weight:600}
+/* ticker */
+.ticker{position:relative;flex:0 0 34px;height:34px;z-index:3;overflow:hidden;border-top:1px solid rgba(232,193,90,.12);
+  background:rgba(8,10,15,.7);display:flex;align-items:center;mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent)}
+.track{display:flex;gap:34px;white-space:nowrap;animation:scroll 140s linear infinite;font:500 11.5px 'IBM Plex Mono';letter-spacing:.06em;color:#A9A293}
+.track span b{color:var(--gold);margin-right:6px}
+.ticker:hover .track{animation-play-state:paused}
+@keyframes scroll{to{transform:translateX(-50%)}}
+@media (max-width:860px){.wrap{grid-template-columns:1fr;padding:28px 22px 12px}.cupzone,.chips{display:none}.lead{font-size:15px}
+  .kpis{grid-template-columns:repeat(3,1fr);margin:0 22px}.k:nth-child(n+4){display:none}h1{font-size:clamp(46px,13vw,78px)}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}h1 .w,.lead,.chips,.tilt,.tag{opacity:1;transform:none}}
+</style></head><body>
+<div class="stage" id="stage">
+  <canvas id="dust"></canvas><div class="grid"></div>
+  <div class="wrap">
+    <div>
+      <span class="live"><span class="dot"></span>Edición 2026 · en semifinales</span>
+      <h1>
+        <span class="line"><span class="w gold" style="animation-delay:.10s">La</span> <span class="w gold" style="animation-delay:.18s">Gloria</span> <span class="w gold" style="animation-delay:.26s">Eterna</span></span>
+        <span class="line"><span class="w outline" style="animation-delay:.38s">en</span> <span class="w gold" style="animation-delay:.46s">números</span></span>
+      </h1>
+      <p class="lead">66 ediciones, 27 campeones y más de seis décadas de <b>Copa Libertadores</b>, contadas con datos:
+        goleadores, asistidores, arqueros, clubes y finales.</p>
+      <div class="chips">
+        <span class="chip" data-go="GOLEADORES"><span class="n">01</span>Goleadores</span>
+        <span class="chip" data-go="ASISTIDORES"><span class="n">02</span>Asistidores</span>
+        <span class="chip" data-go="VALLA INVICTA"><span class="n">04</span>Valla invicta</span>
+        <span class="chip" data-go="FINALES"><span class="n">06</span>Finales</span>
+        <span class="chip" data-go="CAMPEONES"><span class="n">★</span>Campeones</span>
+      </div>
+    </div>
+    <div class="cupzone" id="cupzone">
+      <div class="halo"></div><div class="ring"></div><div class="ring r2"></div><div class="floor"></div>
+      __CUP__
+      <div class="tag"><b>LA COPA</b>Plata 925 · Orfebre Alberto de Gasperi<br>Joyería Camusso · Lima</div>
+    </div>
+  </div>
+  <div class="kpis">
+    <div class="k"><div class="v" data-to="66">0</div><div class="l"><b>Ediciones</b> completas · 1960–2025</div></div>
+    <div class="k"><div class="v" data-to="54">0</div><div class="l"><b>Goles de Spencer</b> · máximo goleador</div></div>
+    <div class="k"><div class="v" data-to="681">0</div><div class="l"><b>Goles de River</b> · club más goleador</div></div>
+    <div class="k"><div class="v" data-to="7" data-suffix="/7">0</div><div class="l"><b>Finales de Independiente</b> · todas ganadas</div></div>
+    <div class="k"><div class="v" data-to="118">0</div><div class="l"><b>Partidos de Fábio</b> · récord histórico</div></div>
+  </div>
+  <div class="ticker"><div class="track" id="track">__TICKER__</div></div>
 </div>
-<div class="rule"></div>
-""", unsafe_allow_html=True)
+<script>
+(function(){
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const stage = document.getElementById('stage');
+  // contadores
+  const ease = t => 1 - Math.pow(1 - t, 4);
+  document.querySelectorAll('.v[data-to]').forEach((el, i) => {
+    const to = +el.dataset.to, suf = el.dataset.suffix || '';
+    const fmt = n => n.toLocaleString('es-AR') + (suf ? '<small>' + suf + '</small>' : '');
+    if (reduce) { el.innerHTML = fmt(to); return; }
+    const dur = 1600 + i * 120, start = performance.now() + 700 + i * 90;
+    function step(now){ const t = Math.min(Math.max((now - start) / dur, 0), 1);
+      el.innerHTML = fmt(Math.round(to * ease(t))); if (t < 1) requestAnimationFrame(step); }
+    requestAnimationFrame(step);
+  });
+  // spotlight + tilt 3D
+  const tilt = document.getElementById('tilt');
+  stage.addEventListener('pointermove', e => {
+    const r = stage.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+    stage.style.setProperty('--mx', (x * 100) + '%'); stage.style.setProperty('--my', (y * 100) + '%');
+    if (tilt && !reduce) tilt.style.transform = `rotateY(${(x - .7) * 16}deg) rotateX(${(.45 - y) * 10}deg)`;
+  });
+  stage.addEventListener('pointerleave', () => { if (tilt) tilt.style.transform = ''; });
+  // navegación a secciones de la página
+  document.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => {
+    try {
+      const doc = window.parent.document, key = c.dataset.go;
+      const hit = [...doc.querySelectorAll('.sec .num')].find(n => n.textContent.toUpperCase().includes(key));
+      if (hit) hit.scrollIntoView({behavior: 'smooth', block: 'start'});
+    } catch (e) {}
+  }));
+  // polvo dorado
+  const cv = document.getElementById('dust'), ctx = cv.getContext('2d');
+  let W, H, P = [];
+  function size(){ W = cv.width = stage.clientWidth * devicePixelRatio; H = cv.height = stage.clientHeight * devicePixelRatio;
+    cv.style.width = stage.clientWidth + 'px'; cv.style.height = stage.clientHeight + 'px';
+    P = Array.from({length: Math.round(stage.clientWidth / 14)}, () => ({x: Math.random() * W, y: Math.random() * H,
+      r: (Math.random() * 1.6 + .3) * devicePixelRatio, v: (Math.random() * .25 + .05) * devicePixelRatio, a: Math.random() * .6 + .15, t: Math.random() * 6}));
+  }
+  size(); addEventListener('resize', size);
+  function draw(){ ctx.clearRect(0, 0, W, H);
+    for (const p of P){ p.y -= p.v; p.t += .02; if (p.y < -5) { p.y = H + 5; p.x = Math.random() * W; }
+      ctx.beginPath(); ctx.arc(p.x + Math.sin(p.t) * 3, p.y, p.r, 0, 6.283);
+      ctx.fillStyle = `rgba(240,205,120,${p.a * (.6 + .4 * Math.sin(p.t * 2))})`; ctx.fill(); }
+    if (!reduce) requestAnimationFrame(draw); }
+  draw();
+})();
+</script></body></html>
+"""
+
+HERO_HEIGHT = 660
+trophy_uri = load_trophy()
+if trophy_uri:
+    cup_html = (f'<div class="tilt" id="tilt" style="--cupmask:url({trophy_uri})">'
+                f'<img class="cup" src="{trophy_uri}" alt="Trofeo de la Copa Libertadores">'
+                f'<div class="glint"></div></div>')
+else:
+    cup_html = '<div class="nocup">Agregá la foto del trofeo<br>en assets/trofeo.png</div>'
+ticker_items = "".join(f'<span><b>{y}</b>{c} {FLAGS.get(p, "")}</span>' for y, c, p in CHAMPIONS)
+hero_doc = (HERO_HTML.replace("__H__", str(HERO_HEIGHT))
+            .replace("__CUP__", cup_html)
+            .replace("__TICKER__", ticker_items * 2))
+components.html(hero_doc, height=HERO_HEIGHT + 8, scrolling=False)
+st.markdown('<div class="rule"></div>', unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 01 · GOLEADORES
