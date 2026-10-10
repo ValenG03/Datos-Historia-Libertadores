@@ -10,6 +10,7 @@ Logo: si querés usar un archivo propio, guardalo como assets/libertadores_logo.
 
 import base64
 import hashlib
+import io
 from pathlib import Path
 
 import pandas as pd
@@ -17,6 +18,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from PIL import Image
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -259,6 +261,120 @@ def load_logo_data_uri():
     return None
 
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ESCUDOS DE LOS CAMPEONES (Wikipedia/Wikimedia → PNG normalizado; fallback: monograma)
+# Para forzar un escudo propio: guardalo como assets/escudos/<slug>.png
+# ──────────────────────────────────────────────────────────────────────────────
+CHAMPION_CLUBS = [
+    # club mostrado, país, slug, título en Wikipedia (es/pt)
+    ("Independiente", "Argentina", "independiente", "Club Atlético Independiente"),
+    ("Boca Juniors", "Argentina", "boca", "Club Atlético Boca Juniors"),
+    ("Peñarol", "Uruguay", "penarol", "Club Atlético Peñarol"),
+    ("Estudiantes", "Argentina", "estudiantes", "Club Estudiantes de La Plata"),
+    ("River Plate", "Argentina", "river", "Club Atlético River Plate"),
+    ("Flamengo", "Brasil", "flamengo", "Clube de Regatas do Flamengo"),
+    ("Olimpia", "Paraguay", "olimpia", "Club Olimpia"),
+    ("Palmeiras", "Brasil", "palmeiras", "Sociedade Esportiva Palmeiras"),
+    ("Nacional", "Uruguay", "nacional", "Club Nacional de Football"),
+    ("São Paulo", "Brasil", "saopaulo", "São Paulo Futebol Clube"),
+    ("Santos", "Brasil", "santos", "Santos Futebol Clube"),
+    ("Grêmio", "Brasil", "gremio", "Grêmio Foot-Ball Porto Alegrense"),
+    ("Cruzeiro", "Brasil", "cruzeiro", "Cruzeiro Esporte Clube"),
+    ("Internacional", "Brasil", "internacional", "Sport Club Internacional"),
+    ("Atlético Nacional", "Colombia", "atlnacional", "Atlético Nacional"),
+    ("Colo-Colo", "Chile", "colocolo", "Club Social y Deportivo Colo-Colo"),
+    ("Atlético Mineiro", "Brasil", "atlmineiro", "Clube Atlético Mineiro"),
+    ("Fluminense", "Brasil", "fluminense", "Fluminense Football Club"),
+    ("Racing Club", "Argentina", "racing", "Racing Club"),
+    ("Argentinos Juniors", "Argentina", "argentinos", "Asociación Atlética Argentinos Juniors"),
+    ("Vélez Sarsfield", "Argentina", "velez", "Club Atlético Vélez Sarsfield"),
+    ("Vasco da Gama", "Brasil", "vasco", "Club de Regatas Vasco da Gama"),
+    ("Once Caldas", "Colombia", "oncecaldas", "Once Caldas"),
+    ("LDU Quito", "Ecuador", "ldu", "Liga Deportiva Universitaria de Quito"),
+    ("Corinthians", "Brasil", "corinthians", "Sport Club Corinthians Paulista"),
+    ("San Lorenzo", "Argentina", "sanlorenzo", "Club Atlético San Lorenzo de Almagro"),
+    ("Botafogo", "Brasil", "botafogo", "Botafogo de Futebol e Regatas"),
+]
+WIKI_UA = {"User-Agent": "LibertadoresDataApp/1.0 (Streamlit educational dashboard)"}
+
+
+def _normalize_png(raw: bytes, size: int = 256) -> str:
+    """Recorta márgenes transparentes y centra el escudo en un lienzo cuadrado idéntico para todos."""
+    im = Image.open(io.BytesIO(raw)).convert("RGBA")
+    bbox = im.getchannel("A").getbbox()
+    if bbox:
+        im = im.crop(bbox)
+    pad = int(size * 0.06)
+    im.thumbnail((size - 2 * pad, size - 2 * pad), Image.LANCZOS)
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    canvas.paste(im, ((size - im.width) // 2, (size - im.height) // 2), im)
+    buf = io.BytesIO()
+    canvas.save(buf, format="PNG", optimize=True)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _wiki_thumbs(lang: str, titles):
+    """Devuelve {título pedido: url de miniatura PNG} usando la API de PageImages."""
+    out = {}
+    try:
+        r = requests.get(
+            f"https://{lang}.wikipedia.org/w/api.php",
+            params={"action": "query", "titles": "|".join(titles), "prop": "pageimages",
+                    "piprop": "thumbnail", "pithumbsize": 400, "format": "json",
+                    "redirects": 1, "formatversion": 2},
+            headers=WIKI_UA, timeout=8,
+        )
+        data = r.json().get("query", {})
+        alias = {}
+        for n in data.get("normalized", []) + data.get("redirects", []):
+            alias[n["to"]] = alias.get(n["from"], n["from"])
+        for page in data.get("pages", []):
+            thumb = page.get("thumbnail", {}).get("source")
+            if thumb:
+                original = page["title"]
+                while original in alias:
+                    original = alias[original]
+                out[original] = thumb
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24 * 7)
+def load_crests():
+    crests = {}
+    pending = []
+    folder = Path(__file__).parent / "assets" / "escudos"
+    for name, _, slug, title in CHAMPION_CLUBS:
+        local = folder / f"{slug}.png"
+        if local.exists():
+            try:
+                crests[slug] = _normalize_png(local.read_bytes())
+                continue
+            except Exception:
+                pass
+        pending.append((slug, title))
+
+    for lang in ("es", "pt"):
+        if not pending:
+            break
+        thumbs = _wiki_thumbs(lang, [t for _, t in pending])
+        still = []
+        for slug, title in pending:
+            url = thumbs.get(title)
+            if url:
+                try:
+                    img = requests.get(url, headers=WIKI_UA, timeout=8)
+                    if img.status_code == 200 and img.headers.get("Content-Type", "").startswith("image/"):
+                        crests[slug] = _normalize_png(img.content)
+                        continue
+                except Exception:
+                    pass
+            still.append((slug, title))
+        pending = still
+    return crests
+
 # ──────────────────────────────────────────────────────────────────────────────
 # STYLE
 # ──────────────────────────────────────────────────────────────────────────────
@@ -307,7 +423,20 @@ p, li, label, .stMarkdown{ color:var(--text); }
 @media (max-width: 640px){ .lib-logo{ width:64px; height:64px; top:10px; right:10px; } .lib-logo img{ max-width:50px; max-height:50px; } }
 
 /* ── HERO ── */
-.hero{ padding:28px 0 8px 0; margin-right:110px; }
+.hero{ padding:28px 0 8px 0; margin-right:110px; display:flex; align-items:center; justify-content:space-between; gap:24px; }
+.hero-cup{ text-align:center; flex:0 0 auto; filter:drop-shadow(0 0 18px rgba(232,193,90,.28)); animation:float 6s ease-in-out infinite; }
+.hero-cup-cap{ font-family:'IBM Plex Mono'; font-size:11px; letter-spacing:.24em; text-transform:uppercase; color:var(--gold); margin-top:8px; }
+@keyframes float{ 0%,100%{ transform:translateY(0); } 50%{ transform:translateY(-6px); } }
+@media (max-width: 900px){ .hero-cup{ display:none; } }
+.sec .num svg{ vertical-align:-2px; margin-right:6px; }
+.crests{ display:grid; grid-template-columns:repeat(auto-fill, minmax(96px, 1fr)); gap:14px; margin:22px 0 10px 0; }
+.crest{ background:linear-gradient(180deg, var(--panel-2), var(--panel)); border:1px solid var(--line); border-radius:14px; padding:12px 8px 10px; text-align:center; transition:border-color .2s, transform .2s; }
+.crest:hover{ border-color:var(--gold); transform:translateY(-2px); }
+.crest img{ width:64px; height:64px; object-fit:contain; display:block; margin:0 auto; }
+.crest .mono{ width:64px; height:64px; margin:0 auto; border-radius:50%; border:1px solid var(--gold-deep); display:flex; align-items:center; justify-content:center; font-family:'Barlow Condensed'; font-weight:800; font-size:22px; color:var(--gold-soft); }
+.crest .n{ font-size:11.5px; color:var(--text); margin-top:8px; line-height:1.2; }
+.crest .t{ font-family:'IBM Plex Mono'; font-size:10.5px; color:var(--gold); margin-top:3px; }
+.signature{ text-align:center; margin:34px 0 6px 0; font-family:'Barlow Condensed'; font-size:22px; letter-spacing:.06em; color:var(--gold); text-shadow:0 0 10px rgba(232,193,90,.35); }
 .eyebrow{ font-family:'IBM Plex Mono'; font-size:12px; letter-spacing:.32em; text-transform:uppercase; color:var(--gold); }
 .hero h1{ font-size:clamp(46px, 7vw, 92px); line-height:.9; margin:10px 0 14px 0; font-weight:800; text-transform:uppercase; }
 .hero h1 span{ background:linear-gradient(180deg, var(--gold-soft), var(--gold) 55%, var(--gold-deep)); -webkit-background-clip:text; background-clip:text; color:transparent; }
@@ -389,8 +518,22 @@ def gold_scale(n):
     return [base[min(i, len(base) - 1)] for i in range(n)]
 
 
+
+def trophy_svg(size=40, uid="t"):
+    """Ícono de copa genérico (dibujo propio), en dorado."""
+    return f"""<svg width="{size}" height="{size}" viewBox="0 0 64 64" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+<defs><linearGradient id="g{uid}" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#F6DE97"/><stop offset=".55" stop-color="#E8C15A"/><stop offset="1" stop-color="#A67C1F"/></linearGradient></defs>
+<path d="M18 6h28v14c0 9-6 16-14 17-8-1-14-8-14-17V6z" fill="url(#g{uid})"/>
+<path d="M18 11H9c0 9 4 14 11 15M46 11h9c0 9-4 14-11 15" fill="none" stroke="url(#g{uid})" stroke-width="3" stroke-linecap="round"/>
+<rect x="29" y="37" width="6" height="9" rx="1" fill="url(#g{uid})"/>
+<path d="M21 46h22l3 6H18z" fill="url(#g{uid})"/>
+<rect x="15" y="52" width="34" height="6" rx="2" fill="url(#g{uid})"/>
+<path d="M26 12c-1 6 0 12 4 16" stroke="#FFF6D8" stroke-opacity=".55" stroke-width="2" fill="none" stroke-linecap="round"/>
+</svg>"""
+
 def section(num, title, desc):
-    st.markdown(f'<div class="sec"><div class="num">{num}</div><h2>{title}</h2><p>{desc}</p></div>',
+    st.markdown(f'<div class="sec"><div class="num">{trophy_svg(16, num[:2])} {num}</div><h2>{title}</h2><p>{desc}</p></div>',
                 unsafe_allow_html=True)
 
 
@@ -402,12 +545,15 @@ def card(tag, big, who, meta, ember=False):
 # ──────────────────────────────────────────────────────────────────────────────
 # HERO
 # ──────────────────────────────────────────────────────────────────────────────
-st.markdown("""
+st.markdown(f"""
 <div class="hero">
-  <div class="eyebrow">Análisis cuantitativo · 1960 — 2026</div>
-  <h1>La Gloria Eterna<br><span>en números</span></h1>
-  <p class="lead">Sesenta y seis ediciones terminadas y una en juego. Goleadores, asistidores, arqueros,
-  clubes y finales de la copa más importante de Sudamérica, contados con datos.</p>
+  <div class="hero-txt">
+    <div class="eyebrow">Análisis cuantitativo · 1960 — 2026</div>
+    <h1>La Gloria Eterna<br><span>en números</span></h1>
+    <p class="lead">Sesenta y seis ediciones terminadas y una en juego. Goleadores, asistidores, arqueros,
+    clubes y finales de la copa más importante de Sudamérica, contados con datos.</p>
+  </div>
+  <div class="hero-cup">{trophy_svg(210, "hero")}<div class="hero-cup-cap">66 copas levantadas</div></div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -563,23 +709,18 @@ El Gráfico (agosto 2025 y septiembre 2026).</div>""", unsafe_allow_html=True)
 # 03 · CLUBES
 # ──────────────────────────────────────────────────────────────────────────────
 section("03 — CLUBES", "Récords colectivos",
-        "La tabla histórica acumulada hasta la final de 2025: quién más hizo, quién más recibió y quién más asistió.")
+        "La tabla histórica acumulada hasta la final de 2025: quién más goles hizo, quién más recibió y quién más títulos ganó.")
 
-k1, k2, k3, k4 = st.columns(4, gap="medium")
+k1, k2, k4 = st.columns(3, gap="medium")
 k1.markdown(card("Más goles a favor", "681", f"{FLAGS['Argentina']} River Plate",
                  "Argentina · 202 victorias y 647 puntos, también récords. Diferencia de gol +250."), unsafe_allow_html=True)
 k2.markdown(card("Más goles en contra", "475", f"{FLAGS['Uruguay']} Nacional",
                  "Uruguay · consecuencia de ser el club con más participaciones (52) y más partidos jugados.", ember=True),
             unsafe_allow_html=True)
-k3.markdown(card("Más asistencias (aprox.)", "3 de 6", f"{FLAGS['Brasil']} Flamengo",
-                 "Brasil · tres de los seis máximos asistidores de la era moderna (De Arrascaeta, Bruno Henrique "
-                 "y Everton Ribeiro) jugaron allí. No hay total oficial por club."), unsafe_allow_html=True)
 k4.markdown(card("Más títulos", "7", f"{FLAGS['Argentina']} Independiente",
                  "Argentina · «Rey de Copas»: 1964, 65, 72, 73, 74, 75 y 84."), unsafe_allow_html=True)
 
-st.markdown("""<div class="note">Goles a favor/en contra: tabla histórica basada en RSSSF (actualizada a la final 2025).
-CONMEBOL no publica asistencias acumuladas por club: la tarjeta de Flamengo es una aproximación a partir del ranking
-individual de asistidores, no un dato oficial.</div>""", unsafe_allow_html=True)
+st.markdown("""<div class="note">Goles a favor/en contra: tabla histórica basada en RSSSF (actualizada a la final 2025).</div>""", unsafe_allow_html=True)
 
 st.markdown("#### Títulos por país y línea de tiempo de campeones")
 c1, c2 = st.columns([1, 1.6], gap="large")
@@ -758,7 +899,7 @@ with c1:
 with c2:
     st.markdown("""
     <div class="fact"><b>18 partidos invicto</b><span>Récord compartido por Atlético Mineiro (2019-22) y Palmeiras (2021-22).</span></div>
-    <div class="fact"><b>Independiente Rivadavia</b><span>Debutó en 2026 y cerró la fase de grupos sin perder: cinco triunfos y un empate.</span></div>
+    <div class="fact"><b>Flamengo 2022 · campeón invicto</b><span>13 partidos, 12 victorias y 1 empate (94,9% de los puntos): la mejor campaña de los siete campeones que nunca perdieron en toda la Copa.</span></div>
     """, unsafe_allow_html=True)
 with c3:
     st.markdown("""
@@ -783,3 +924,25 @@ de corte. Datos actualizados a octubre de 2026; la edición 2026 todavía no ter
 <a href="https://en.wikipedia.org/wiki/Copa_Libertadores" target="_blank">Wikipedia</a>
 </div>
 """, unsafe_allow_html=True)
+
+titles_by_club = CHAMPS.groupby("Campeón").size().to_dict()
+alias_titles = {"Racing Club": "Racing"}
+crest_imgs = load_crests()
+tiles = []
+for name, pais, slug, _ in sorted(CHAMPION_CLUBS, key=lambda c: (-titles_by_club.get(alias_titles.get(c[0], c[0]), 0), c[0])):
+    n_tit = titles_by_club.get(alias_titles.get(name, name), 0)
+    if slug in crest_imgs:
+        visual = f'<img src="{crest_imgs[slug]}" alt="Escudo de {name}" loading="lazy">'
+    else:
+        initials = "".join(w[0] for w in name.replace("-", " ").split()[:2]).upper()
+        visual = f'<div class="mono">{initials}</div>'
+    tiles.append(f'<div class="crest" title="{name} · {n_tit} título(s)">{visual}'
+                 f'<div class="n">{FLAGS.get(pais, "")} {name}</div>'
+                 f'<div class="t">{"🏆" * n_tit if n_tit <= 4 else f"🏆 × {n_tit}"}</div></div>')
+st.markdown(f"""
+<div class="sec" style="margin-top:40px"><div class="num">{trophy_svg(16, "cl")} CAMPEONES</div>
+<h2>Los 27 campeones de América</h2></div>
+<div class="crests">{"".join(tiles)}</div>
+""", unsafe_allow_html=True)
+st.markdown('<div class="signature">Análisis de datos hecho por Valentín Gerold en colaboración con la IA</div>',
+            unsafe_allow_html=True)
